@@ -323,7 +323,7 @@ where
     }
 
     fn handle_rx(&mut self, buf: &mut [u8]) {
-        debug!("rx: {}", HexSlice(&buf[..40]));
+        trace!("rx: {}", HexSlice(&buf[..40]));
 
         let buf_len = buf.len();
         let h =
@@ -364,7 +364,7 @@ where
             },
             // serial
             ESP_SERIAL_IF => {
-                debug!("serial rx: {}", HexSlice(payload));
+                trace!("serial rx: {}", HexSlice(payload));
                 if payload.len() < SERIAL_MSG_HEADER_LEN {
                     warn!("serial rx: too short");
                     return;

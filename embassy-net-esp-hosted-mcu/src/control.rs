@@ -365,7 +365,7 @@ impl<'a> Control<'a> {
     }
 
     async fn ioctl_inner(&mut self) -> Result<(), Error> {
-        debug!("ioctl req: {:?}", &self.msg);
+        trace!("ioctl req: {:?}", &self.msg);
 
         // Theoretical max overhead is 29 bytes. Biggest message is ota write with 256 bytes.
         let mut buf = [0u8; 256 + 29];
@@ -399,7 +399,7 @@ impl<'a> Control<'a> {
 
         ioctl.defuse();
 
-        debug!("ioctl resp bytes ({}): {}", resp_len, HexSlice(&buf[..resp_len]));
+        trace!("ioctl resp bytes ({}): {}", resp_len, HexSlice(&buf[..resp_len]));
 
         // Hand-written minimal protobuf parser — avoids Rpc::decode_message() which has
         // ~200 match arms and consumes significant CPU stack even at opt-level=2.
