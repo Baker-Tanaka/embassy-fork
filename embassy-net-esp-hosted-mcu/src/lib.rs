@@ -12,7 +12,6 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::OutputPin;
 
 use crate::ioctl::{PendingIoctl, Shared};
-use crate::proto::{Rpc, Rpc_};
 
 #[allow(unused)]
 #[allow(non_snake_case)]
@@ -193,7 +192,7 @@ pub struct Runner<'a, I, OUT> {
 }
 
 #[cfg_attr(all(not(feature = "log"), not(feature = "defmt")), allow(unused))]
-struct HexSlice<'a>(&'a [u8]);
+pub(crate) struct HexSlice<'a>(pub &'a [u8]);
 
 #[cfg(feature = "log")]
 impl<'a> core::fmt::Display for HexSlice<'a> {
@@ -324,7 +323,7 @@ where
     }
 
     fn handle_rx(&mut self, buf: &mut [u8]) {
-        trace!("rx: {}", HexSlice(&buf[..40]));
+        debug!("rx: {}", HexSlice(&buf[..40]));
 
         let buf_len = buf.len();
         let h =
@@ -365,7 +364,7 @@ where
             },
             // serial
             ESP_SERIAL_IF => {
-                trace!("serial rx: {}", HexSlice(payload));
+                debug!("serial rx: {}", HexSlice(payload));
                 if payload.len() < SERIAL_MSG_HEADER_LEN {
                     warn!("serial rx: too short");
                     return;
@@ -375,7 +374,7 @@ where
                     b"\x01\x06\x00RPCRsp\x02" => false,
                     b"\x01\x06\x00RPCEvt\x02" => true,
                     _ => {
-                        warn!("serial rx: bad tlv");
+                        warn!("serial rx: bad tlv: {}", HexSlice(&payload[..SERIAL_MSG_HEADER_LEN.min(payload.len())]));
                         return;
                     }
                 };
@@ -402,30 +401,86 @@ where
     }
 
     fn handle_event(&mut self, data: &[u8]) {
-        use micropb::MessageDecode;
-        let mut event = Rpc::default();
-        if event.decode_from_bytes(data).is_err() {
-            warn!("failed to parse event");
+        // Scratch minimal protobuf parser — no Rpc struct, no micropb, zero heap.
+        // Protobuf encoding: msg_type=field1(varint), msg_id=field2(varint),
+        // payload=field<msg_id>(LEN).  resp inside payload = field1(varint).
+        //
+        // Event RpcId constants (from esp_hosted_rpc.proto):
+        //   769 = EventEspInit, 770 = EventHeartbeat
+        //   775 = EventStaConnected, 776 = EventStaDisconnected
+
+        let mut pos = 0usize;
+        let mut msg_id: u32 = 0;
+        let mut resp: i32 = 0;
+
+        // First pass: collect msg_id
+        while pos < data.len() {
+            let Some(tag) = pb_read_varint(data, &mut pos) else { break };
+            let field_num = (tag >> 3) as u32;
+            let wire_type = (tag & 7) as u8;
+            if field_num == 2 && wire_type == 0 {
+                msg_id = match pb_read_varint(data, &mut pos) {
+                    Some(v) => v as u32,
+                    None => break,
+                };
+                break; // msg_id found, stop first pass
+            } else if !pb_skip_field(data, &mut pos, wire_type) {
+                break;
+            }
+        }
+
+        if msg_id == 0 {
+            warn!("handle_event: could not parse msg_id: {} bytes: {}", data.len(), HexSlice(data));
             return;
         }
 
-        debug!("event: {:?}", &event);
+        // Second pass: find payload sub-message (field number == msg_id value)
+        let mut pos2 = 0usize;
+        while pos2 < data.len() {
+            let Some(tag) = pb_read_varint(data, &mut pos2) else { break };
+            let field_num = (tag >> 3) as u32;
+            let wire_type = (tag & 7) as u8;
+            if field_num == msg_id && wire_type == 2 {
+                // Read sub-message length
+                let Some(sub_len) = pb_read_varint(data, &mut pos2) else { break };
+                let sub_len = sub_len as usize;
+                let sub_start = pos2;
+                let sub_end = sub_start.saturating_add(sub_len).min(data.len());
+                // Parse resp (field 1, varint) from sub-message
+                let sub = &data[sub_start..sub_end];
+                let mut sp = 0usize;
+                while sp < sub.len() {
+                    let Some(stag) = pb_read_varint(sub, &mut sp) else { break };
+                    let sfn = (stag >> 3) as u32;
+                    let swt = (stag & 7) as u8;
+                    if sfn == 1 && swt == 0 {
+                        resp = pb_read_varint(sub, &mut sp).unwrap_or(0) as i32;
+                        break;
+                    } else if !pb_skip_field(sub, &mut sp, swt) {
+                        break;
+                    }
+                }
+                break;
+            } else if !pb_skip_field(data, &mut pos2, wire_type) {
+                break;
+            }
+        }
 
-        let Some(payload) = &event.payload else {
-            warn!("event without payload?");
-            return;
-        };
+        debug!("event: msg_id={} resp={}", msg_id, resp);
 
-        match payload {
-            Rpc_::Payload::EventEspInit(_) => {
+        match msg_id {
+            769 => {
+                // EventEspInit
                 self.shared.init_done();
                 self.reset_heartbeat_deadline();
             }
-            Rpc_::Payload::EventHeartbeat(_) => {
+            770 => {
+                // EventHeartbeat
                 self.reset_heartbeat_deadline();
             }
-            Rpc_::Payload::EventStaConnected(e) => {
-                info!("connected, code {}", e.resp);
+            775 => {
+                // EventStaConnected
+                info!("connected, code {}", resp);
                 self.state_ch.set_link_state(LinkState::Up);
                 self.shared.link_up_done();
 
@@ -435,8 +490,9 @@ where
                     notifier.reset();
                 }
             }
-            Rpc_::Payload::EventStaDisconnected(e) => {
-                info!("disconnected, code {}", e.resp);
+            776 => {
+                // EventStaDisconnected
+                info!("disconnected, code {}", resp);
                 self.state_ch.set_link_state(LinkState::Down);
                 self.shared.link_down_done();
 
@@ -444,7 +500,9 @@ where
                     notifier.signal(EspHostedEvents::Disconnected);
                 }
             }
-            _ => {}
+            _ => {
+                debug!("unknown event msg_id={}", msg_id);
+            }
         }
     }
 
@@ -458,6 +516,64 @@ where
         self.reset.set_high().unwrap();
         Timer::after_millis(1000).await;
         self.next_seq = 1;
+    }
+}
+
+/// Decode a protobuf varint from `data` starting at `*pos`.
+/// Advances `*pos` past the varint. Returns `None` on truncation or overflow (>10 bytes).
+pub(crate) fn pb_read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        result |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+    }
+    None // varint exceeds 10 bytes
+}
+
+/// Skip one protobuf field value given its `wire_type`.
+/// Returns `false` if the data is malformed or truncated.
+pub(crate) fn pb_skip_field(data: &[u8], pos: &mut usize, wire_type: u8) -> bool {
+    match wire_type {
+        0 => pb_read_varint(data, pos).is_some(), // varint
+        1 => {
+            // 64-bit fixed
+            if *pos + 8 <= data.len() {
+                *pos += 8;
+                true
+            } else {
+                false
+            }
+        }
+        2 => {
+            // length-delimited
+            if let Some(len) = pb_read_varint(data, pos) {
+                let len = len as usize;
+                if *pos + len <= data.len() {
+                    *pos += len;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        5 => {
+            // 32-bit fixed
+            if *pos + 4 <= data.len() {
+                *pos += 4;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false, // unknown wire type
     }
 }
 
