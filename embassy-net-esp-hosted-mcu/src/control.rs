@@ -144,8 +144,7 @@ impl<'a> Control<'a> {
         self.start_wifi().await?;
 
         let mac_addr = self.get_mac_addr().await?;
-        self.state_ch
-            .set_hardware_address(HardwareAddress::Ethernet(mac_addr));
+        self.state_ch.set_hardware_address(HardwareAddress::Ethernet(mac_addr));
 
         Ok(())
     }
@@ -338,13 +337,7 @@ impl<'a> Control<'a> {
         for _ in 0..length {
             let req = proto::Rpc_Req_WifiScanGetApRecord::default();
 
-            ioctl!(
-                self,
-                ReqWifiScanGetApRecord,
-                RespWifiScanGetApRecord,
-                req,
-                resp
-            );
+            ioctl!(self, ReqWifiScanGetApRecord, RespWifiScanGetApRecord, req, resp);
 
             ap_list
                 .entries
@@ -363,7 +356,7 @@ impl<'a> Control<'a> {
     }
 
     async fn ioctl(&mut self, msg: &mut CtrlMsg) -> Result<(), Error> {
-        debug!("ioctl req: {:?}", &msg);
+        debug!("ioctl request id: {:?}", msg.msg_id);
 
         // Theoretical max overhead is 29 bytes. Biggest message is ota write with 256 bytes.
         let mut buf = [0u8; 256 + 29];
@@ -401,7 +394,7 @@ impl<'a> Control<'a> {
             warn!("failed to deserialize control response");
             Error::Internal
         })?;
-        debug!("ioctl resp: {:?}", msg);
+        debug!("ioctl response id: {:?}", msg.msg_id);
 
         Ok(())
     }

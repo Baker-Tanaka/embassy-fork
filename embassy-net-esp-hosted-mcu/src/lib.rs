@@ -109,6 +109,7 @@ enum InterfaceType {
 }
 const ESP_STA_IF: u8 = 1;
 const ESP_SERIAL_IF: u8 = 3;
+const ESP_PRIV_IF: u8 = 5;
 
 const SERIAL_MSG_HEADER_LEN: usize = 12;
 
@@ -314,7 +315,7 @@ where
             }
 
             if tx_buf[0] != 0 {
-                trace!("tx: {}", HexSlice(&tx_buf[..40]));
+                trace!("tx header: {}", HexSlice(&tx_buf[..PayloadHeader::SIZE]));
             }
 
             self.iface.transfer(rx_buf, tx_buf).await;
@@ -324,11 +325,10 @@ where
     }
 
     fn handle_rx(&mut self, buf: &mut [u8]) {
-        trace!("rx: {}", HexSlice(&buf[..40]));
+        trace!("rx header: {}", HexSlice(&buf[..PayloadHeader::SIZE]));
 
         let buf_len = buf.len();
-        let h =
-            PayloadHeader::from_bytes_mut((&mut buf[..PayloadHeader::SIZE]).try_into().unwrap());
+        let h = PayloadHeader::from_bytes_mut((&mut buf[..PayloadHeader::SIZE]).try_into().unwrap());
 
         if h.len == 0 || h.offset as usize != PayloadHeader::SIZE {
             return;
@@ -345,10 +345,7 @@ where
         h.checksum = 0;
         let got_checksum = checksum(&buf[..PayloadHeader::SIZE + payload_len]);
         if want_checksum != got_checksum {
-            warn!(
-                "rx: bad checksum. Got {:04x}, want {:04x}",
-                got_checksum, want_checksum
-            );
+            warn!("rx: bad checksum. Got {:04x}, want {:04x}", got_checksum, want_checksum);
             return;
         }
 
@@ -365,7 +362,7 @@ where
             },
             // serial
             ESP_SERIAL_IF => {
-                trace!("serial rx: {}", HexSlice(payload));
+                trace!("serial rx length: {}", payload.len());
                 if payload.len() < SERIAL_MSG_HEADER_LEN {
                     warn!("serial rx: too short");
                     return;
@@ -397,6 +394,7 @@ where
                     self.shared.ioctl_done(data);
                 }
             }
+            ESP_PRIV_IF => debug!("received private transport packet; waiting for RPC ESPInit"),
             _ => warn!("unknown iftype {}", if_type_and_num),
         }
     }
@@ -404,8 +402,16 @@ where
     fn handle_event(&mut self, data: &[u8]) {
         use micropb::MessageDecode;
         let mut event = Rpc::default();
-        if event.decode_from_bytes(data).is_err() {
-            warn!("failed to parse event");
+        if let Err(error) = event.decode_from_bytes(data) {
+            #[cfg(feature = "defmt")]
+            warn!("failed to parse event: {:?}", defmt::Debug2Format(&error));
+            #[cfg(feature = "log")]
+            warn!("failed to parse event: {:?}", error);
+            #[cfg(not(any(feature = "defmt", feature = "log")))]
+            let _ = error;
+            if matches!(self.shared.state(), ioctl::ControlState::Init) && data.len() <= 16 {
+                debug!("startup event bytes: {:02x}", fmt::Bytes(data));
+            }
             return;
         }
 
@@ -467,4 +473,21 @@ fn checksum(buf: &[u8]) -> u16 {
         res = res.wrapping_add(b as _);
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use micropb::MessageDecode;
+
+    #[test]
+    fn decodes_esp_hosted_2_12_9_init_event() {
+        let bytes = [0x08, 0x03, 0x10, 0x81, 0x06, 0x8a, 0x30, 0x02, 0x10, 0x03];
+        let mut event = Rpc::default();
+        event.decode_from_bytes(&bytes).unwrap();
+        match event.payload {
+            Some(Rpc_::Payload::EventEspInit(init)) => assert_eq!(init.cp_reset_reason, 3),
+            _ => panic!("expected ESPInit event"),
+        }
+    }
 }

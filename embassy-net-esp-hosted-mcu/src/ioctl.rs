@@ -4,8 +4,6 @@ use core::task::Poll;
 
 use embassy_sync::waitqueue::WakerRegistration;
 
-use crate::fmt::Bytes;
-
 #[derive(Clone, Copy)]
 pub struct PendingIoctl {
     pub buf: *mut [u8],
@@ -136,7 +134,7 @@ impl Shared {
     }
 
     pub async fn ioctl(&self, buf: &mut [u8], req_len: usize) -> usize {
-        trace!("ioctl req bytes: {:02x}", Bytes(&buf[..req_len]));
+        trace!("ioctl request length: {}", req_len);
 
         {
             let mut this = self.0.borrow_mut();
@@ -150,7 +148,7 @@ impl Shared {
     pub fn ioctl_done(&self, response: &[u8]) {
         let mut this = self.0.borrow_mut();
         if let IoctlState::Sent { buf } = this.ioctl {
-            trace!("ioctl resp bytes: {:02x}", Bytes(response));
+            trace!("ioctl response length: {}", response.len());
 
             // TODO fix this
             (unsafe { &mut *buf }[..response.len()]).copy_from_slice(response);

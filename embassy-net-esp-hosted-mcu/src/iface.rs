@@ -1,4 +1,4 @@
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::SpiDevice;
@@ -25,6 +25,7 @@ pub struct SpiInterface<SPI, IN> {
     spi: SPI,
     handshake: IN,
     ready: IN,
+    transfers: u32,
 }
 
 impl<SPI, IN> SpiInterface<SPI, IN>
@@ -34,7 +35,12 @@ where
 {
     /// Create a new SpiInterface.
     pub fn new(spi: SPI, handshake: IN, ready: IN) -> Self {
-        Self { spi, handshake, ready }
+        Self {
+            spi,
+            handshake,
+            ready,
+            transfers: 0,
+        }
     }
 }
 
@@ -44,15 +50,53 @@ where
     IN: InputPin + Wait,
 {
     async fn wait_for_handshake(&mut self) {
-        self.handshake.wait_for_high().await.unwrap();
+        loop {
+            if let Ok(result) = with_timeout(Duration::from_secs(5), self.handshake.wait_for_high()).await {
+                result.unwrap();
+                return;
+            }
+            warn!(
+                "SPI waiting for HANDSHAKE: HS={} DR={} transfers={}",
+                self.handshake.is_high().unwrap(),
+                self.ready.is_high().unwrap(),
+                self.transfers
+            );
+        }
     }
 
     async fn wait_for_ready(&mut self) {
-        self.ready.wait_for_high().await.unwrap();
+        loop {
+            if let Ok(result) = with_timeout(Duration::from_secs(5), self.ready.wait_for_high()).await {
+                result.unwrap();
+                return;
+            }
+            warn!(
+                "SPI waiting for DATA_READY: HS={} DR={} transfers={}",
+                self.handshake.is_high().unwrap(),
+                self.ready.is_high().unwrap(),
+                self.transfers
+            );
+        }
     }
 
     async fn transfer(&mut self, rx: &mut [u8], tx: &[u8]) {
+        if self.transfers < 4 {
+            debug!(
+                "SPI transfer start: HS={} DR={} tx_len={} rx_len={}",
+                self.handshake.is_high().unwrap(),
+                self.ready.is_high().unwrap(),
+                tx.len(),
+                rx.len()
+            );
+        }
         self.spi.transfer(rx, tx).await.unwrap();
+        if self.transfers < 4 {
+            debug!(
+                "SPI received header: {:02x}",
+                crate::fmt::Bytes(&rx[..rx.len().min(12)])
+            );
+        }
+        self.transfers = self.transfers.saturating_add(1);
 
         // The esp-hosted firmware deasserts the HANDSHAKE pin a few us AFTER ending the SPI transfer
         // If we check it again too fast, we'll see it's high from the previous transfer, and if we send it
